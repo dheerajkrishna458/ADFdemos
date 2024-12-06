@@ -1,0 +1,114 @@
+{
+    "name": "Global_parameter",
+    "properties": {
+        "activities": [
+            {
+                "name": "CheckActiveRuns",
+                "type": "WebActivity",
+                "dependsOn": [],
+                "policy": {
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "method": "POST",
+                    "url": {
+                        "value": "https://management.azure.com/subscriptions/637a7503-aa0c-4f27-b6a7-5ea860892cc8/resourceGroups/dev-databricks-demo/providers/Microsoft.DataFactory/factories/devdemoADF/queryPipelineRuns?api-version=2018-06-01\n",
+                        "type": "Expression"
+                    },
+                    "body": {
+                        "value": "{\n  \"lastUpdatedAfter\": \"@{formatDateTime(addMinutes(utcNow(), -5), 'yyyy-MM-ddTHH:mm:ssZ')}\",\n  \"lastUpdatedBefore\": \"@{utcNow()}\",\n  \"filters\": [\n    {\n      \"operand\": \"Status\",\n      \"operator\": \"Equals\",\n      \"values\": [\"InProgress\"]\n    },\n    {\n      \"operand\":\"PipelineName\",\n      \"operator\": \"Equals\",\n      \"values\":[\"wait\"]\n    }\n  ]\n}",
+                        "type": "Expression"
+                    },
+                    "authentication": {
+                        "type": "MSI",
+                        "resource": "https://management.azure.com/"
+                    }
+                }
+            },
+            {
+                "name": "ParseResponse",
+                "type": "SetVariable",
+                "dependsOn": [
+                    {
+                        "activity": "CheckActiveRuns",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "variableName": "ActiveRunExists",
+                    "value": {
+                        "value": "@greater(length(activity('CheckActiveRuns').output.value), 0)",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "IfActiveRunExists",
+                "type": "IfCondition",
+                "dependsOn": [
+                    {
+                        "activity": "ParseResponse",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "userProperties": [],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@equals(variables('ActiveRunExists'), true)",
+                        "type": "Expression"
+                    },
+                    "ifFalseActivities": [
+                        {
+                            "name": "Set variable1",
+                            "type": "SetVariable",
+                            "dependsOn": [],
+                            "policy": {
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "userProperties": [],
+                            "typeProperties": {
+                                "variableName": "ActiveRunExists",
+                                "value": true
+                            }
+                        }
+                    ],
+                    "ifTrueActivities": [
+                        {
+                            "name": "FailPipeline",
+                            "type": "Fail",
+                            "dependsOn": [],
+                            "userProperties": [],
+                            "typeProperties": {
+                                "message": "pipeline already running",
+                                "errorCode": "0863",
+                                "failMessage": "Pipeline already running. Exiting."
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "variables": {
+            "ActiveRunExists": {
+                "type": "Boolean"
+            }
+        },
+        "annotations": [],
+        "lastPublishTime": "2024-12-05T08:08:01Z"
+    },
+    "type": "Microsoft.DataFactory/factories/pipelines"
+}
