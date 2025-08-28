@@ -1,0 +1,147 @@
+
+test_init
+This test verifies the correct initialization of the ConfigManager attributes.
+
+def test_init_sets_attributes_correctly(config_manager, mock_spark, mock_env_config, mock_delta_manager):
+    """Tests that the initializer sets the correct attributes."""
+    assert config_manager.spark == mock_spark
+    assert config_manager.delta_manager == mock_delta_manager
+    assert config_manager.env_config == mock_env_config
+    assert config_manager.config_table_fqn == "mock_catalog.mock_schema.config_table"
+    assert config_manager.config_cache is None
+test_validate_config_df
+These tests ensure the validation logic correctly identifies missing columns and invalid data.
+
+def test_validate_config_df_raises_error_on_missing_columns(config_manager):
+    """Tests that validation fails for a DataFrame with missing required columns."""
+    mock_df = Mock(columns=['source_folder', 'target_table_name'])
+    with pytest.raises(ConfigError, match="Missing required columns"):
+        config_manager._validate_config_df(mock_df)
+
+def test_validate_config_df_raises_error_on_invalid_threshold(config_manager):
+    """Tests that validation fails for a DataFrame with invalid allowed_threshold values."""
+    mock_df = Mock(columns=[f.name for f in fields(ConfigEntry)])
+    mock_df.filter.return_value.count.return_value = 1
+    with pytest.raises(ConfigError, match="invalid 'allowed_threshold'"):
+        config_manager._validate_config_df(mock_df)
+    mock_df.filter.assert_called_once()
+
+def test_validate_config_df_passes_on_valid_data(config_manager, valid_config_df):
+    """Tests that validation passes for a valid DataFrame."""
+    valid_config_df.filter.return_value.count.return_value = 0
+    # No exception should be raised
+    config_manager._validate_config_df(valid_config_df)
+    assert True
+test_load_config
+These tests cover the main load_config method, including filtering, caching, and error handling.
+
+@patch('your_module.ConfigManager._validate_config_df')
+def test_load_config_loads_and_filters_correctly(mock_validate, config_manager, mock_spark, valid_config_df):
+    """Tests that load_config loads, filters, and validates the DataFrame."""
+    mock_spark.table.return_value = valid_config_df
+    
+    config_list = config_manager.load_config(category_1="cat1", target_table="tableA")
+    
+    mock_spark.table.assert_called_once_with(config_manager.config_table_fqn)
+    assert valid_config_df.filter.call_count == 3  # filter for is_active, cat1, tableA
+    mock_validate.assert_called_once_with(valid_config_df)
+    assert len(config_list) == 1
+    assert isinstance(config_list[0], ConfigEntry)
+    
+def test_load_config_returns_empty_list_if_no_configs_found(config_manager, mock_spark):
+    """Tests that load_config returns an empty list if no active configs match."""
+    mock_df = Mock()
+    mock_df.filter.return_value.count.return_value = 0
+    mock_spark.table.return_value = mock_df
+
+    config_list = config_manager.load_config(category_1="non_existent")
+    assert config_list == []
+    
+def test_load_config_raises_error_on_failure(config_manager, mock_spark):
+    """Tests that load_config raises a ConfigError on underlying exception."""
+    mock_spark.table.side_effect = Exception("Mock DB error")
+    with pytest.raises(ConfigError, match="Failed to load or process configurations"):
+        config_manager.load_config()
+
+def test_load_config_uses_cache(config_manager, valid_config_df):
+    """Tests that load_config returns cached data on subsequent calls."""
+    config_manager._config_cache = valid_config_df.collect()
+    with patch.object(config_manager.spark, 'table') as mock_table:
+        config_list = config_manager.load_config()
+        mock_table.assert_not_called()
+        assert len(config_list) == 1
+        
+def test_load_config_forces_reload(config_manager, mock_spark, valid_config_df):
+    """Tests that force_reload bypasses the cache."""
+    config_manager._config_cache = [Mock()]
+    mock_spark.table.return_value = valid_config_df
+    
+    config_list = config_manager.load_config(force_reload=True)
+    
+    mock_spark.table.assert_called_once()
+    assert len(config_list) == 1
+test_load_all_configs
+def test_load_all_configs_loads_all_data(config_manager, mock_spark, valid_config_df):
+    """Tests that load_all_configs returns all configurations regardless of filters."""
+    mock_spark.table.return_value = valid_config_df
+    
+    config_list = config_manager.load_all_configs()
+    
+    mock_spark.table.assert_called_once_with(config_manager.config_table_fqn)
+    assert len(config_list) == 1
+    assert isinstance(config_list[0], ConfigEntry)
+test_config_table_schema
+def test_config_table_schema_returns_correct_struct_type(config_manager):
+    """Tests that the schema method returns a StructType with the correct fields."""
+    schema = config_manager.config_table_schema()
+    assert isinstance(schema, StructType)
+    assert "source_folder" in schema.fieldNames()
+    assert schema["allowed_threshold"].dataType == StringType()  # Type should be StringType for reading from CSV
+test_update_config_table_schema
+def test_update_config_table_schema_calls_saveAsTable_and_set_properties(config_manager, mock_spark, mock_delta_manager):
+    """Tests that the method updates the schema and sets table properties."""
+    config_manager.update_config_table_schema()
+    mock_spark.createDataFrame.return_value.write.format.return_value.option.return_value.mode.return_value.saveAsTable.assert_called_once_with(config_manager.config_table_fqn)
+    mock_delta_manager.set_table_properties.assert_called_once_with(config_manager.config_table_fqn)
+test_update_config_table
+These tests use a combination of mocking to simulate the ADLS file existence and the merge operation.
+
+@patch('your_module.FileManager.path_exists', return_value=True)
+@patch('your_module.ConfigManager.validate_config_file_data', return_value=True)
+def test_update_config_table_performs_merge_if_file_exists_and_is_valid(mock_validate, mock_path_exists, config_manager, mock_spark, mock_delta_manager):
+    """Tests that the table is updated if the config file exists and is valid."""
+    mock_spark.read.option.return_value.csv.return_value = Mock()
+    config_manager.update_config_table()
+    mock_delta_manager.merge_df_to_table.assert_called_once()
+    
+@patch('your_module.FileManager.path_exists', return_value=False)
+def test_update_config_table_skips_merge_if_file_does_not_exist(mock_path_exists, config_manager, mock_delta_manager):
+    """Tests that no merge operation is performed if the config file doesn't exist."""
+    config_manager.update_config_table()
+    mock_delta_manager.merge_df_to_table.assert_not_called()
+test_validate_config_file_data
+These tests check the validation logic for the config file data.
+
+def test_validate_config_file_data_raises_on_invalid_header(config_manager):
+    """Tests that a header mismatch raises an InvalidConfigFileHeader error."""
+    mock_df = Mock(columns=["category_1", "missing_col"])
+    with pytest.raises(InvalidConfigFileHeader):
+        config_manager.validate_config_file_data(mock_df)
+
+def test_validate_config_file_data_returns_true_for_valid_data(config_manager):
+    """Tests that validation returns True for valid data."""
+    mock_df = Mock(columns=[f.name for f in fields(ConfigEntry)])
+    mock_df.count.return_value = 10
+    mock_df.filter.return_value.count.return_value = 10
+    
+    with patch.object(config_manager.config_table_schema(), 'fields', return_value=[StructField(f.name, StringType(), True) for f in fields(ConfigEntry)]):
+        assert config_manager.validate_config_file_data(mock_df) is True
+
+def test_validate_config_file_data_returns_false_for_invalid_data(config_manager):
+    """Tests that validation returns False for invalid data."""
+    mock_df = Mock(columns=[f.name for f in fields(ConfigEntry)])
+    mock_df.count.return_value = 10
+    mock_df.filter.return_value.count.return_value = 9 # One invalid record
+    
+    with patch.object(config_manager.config_table_schema(), 'fields', return_value=[StructField(f.name, StringType(), True) for f in fields(ConfigEntry)]):
+        assert config_manager.validate_config_file_data(mock_df) is False
