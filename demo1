@@ -1,0 +1,280 @@
+import pytest
+from unittest.mock import MagicMock, patch
+from pyspark.sql import SparkSession, DataFrame, Row
+from pyspark.sql import functions as F
+import datetime
+
+# Mock classes and enums as they would be defined
+class AuditLogger:
+    def log_file_status(self, *args, **kwargs):
+        pass
+    def log_error(self, *args, **kwargs):
+        pass
+
+class DeltaManager:
+    def merge_df_to_table(self, *args, **kwargs):
+        pass
+    def append_df_to_table(self, *args, **kwargs):
+        pass
+    def set_table_properties(self, *args, **kwargs):
+        pass
+    bronze_tbl_properties = {"delta.logRetentionDuration": "interval 30 days"}
+
+class EnvironmentConfig:
+    def get_file_list_fqn(self):
+        return "mock_catalog.mock_schema.file_list"
+    def get_bad_records_adls_path_fqn(self, source_folder):
+        return f"/mock_path/{source_folder}/bad_records"
+    def construct_catalog_name(self, catalog_name):
+        return "mock_catalog"
+    def construct_schema_name(self, schema_name):
+        return "mock_schema"
+
+class DataProcessor:
+    def trim_all_string_columns(self, df):
+        return df
+
+class WidgetManager:
+    databricks_run_id = "test_run_id"
+
+class FileStatus:
+    PROCESSING = "PROCESSING"
+    SUCCESS = "SUCCESS"
+    THRESHOLD_FAIL = "THRESHOLD_FAIL"
+    ERROR = "ERROR"
+    EMPTY = "EMPTY"
+
+class MultiSplitFileWithHeaderNotFound(Exception):
+    pass
+
+
+@pytest.fixture
+def mock_dependencies():
+    """Mocks all the external dependencies for BronzeWriter."""
+    spark = MagicMock(spec=SparkSession)
+    dbutils = MagicMock()
+    logger = MagicMock(spec=AuditLogger)
+    delta_manager = MagicMock(spec=DeltaManager)
+    env_config = MagicMock(spec=EnvironmentConfig)
+    data_processor = MagicMock(spec=DataProcessor)
+    widgets = MagicMock(spec=WidgetManager)
+    
+    # Set default mock return values for simplicity
+    delta_manager.bronze_tbl_properties = {"key": "value"}
+    widgets.databricks_run_id = "test_run_id"
+    
+    # Mocking a Spark DataFrame
+    mock_df = MagicMock(spec=DataFrame)
+    mock_df.isEmpty.return_value = False
+    mock_df.count.return_value = 1
+    mock_df.filter.return_value = mock_df
+    mock_df.collect.return_value = [
+        Row(file_path="mock/path/file1.csv", file_name="file1.csv")
+    ]
+    
+    mock_spark_session = MagicMock(spec=SparkSession)
+    mock_spark_session.createDataFrame.return_value = mock_df
+    mock_spark_session.sql.return_value = mock_df
+    
+    return {
+        "spark": spark,
+        "dbutils": dbutils,
+        "logger": logger,
+        "delta_manager": delta_manager,
+        "env_config": env_config,
+        "data_processor": data_processor,
+        "widgets": widgets,
+        "mock_df": mock_df,
+    }
+
+# Patching the private methods of BronzeWriter for isolated testing
+@pytest.fixture(autouse=True)
+def patch_private_methods():
+    with patch("your_module.BronzeWriter._read_source_df") as mock_read_source, \
+         patch("your_module.BronzeWriter._get_record_counts") as mock_get_counts, \
+         patch("your_module.BronzeWriter._get_datetime_now") as mock_get_datetime, \
+         patch("your_module.BronzeWriter._finalize_file_list_status") as mock_finalize_status:
+        
+        # Configure the private method mocks
+        mock_get_datetime.return_value = datetime.datetime(2025, 9, 9, 14, 8, 53)
+        mock_read_source.return_value = MagicMock(spec=DataFrame, columns=["_corrupt_record", "file_name"])
+        mock_get_counts.return_value = MagicMock(spec=DataFrame)
+        mock_finalize_status.return_value = None
+        
+        yield {
+            "mock_read_source": mock_read_source,
+            "mock_get_counts": mock_get_counts,
+            "mock_get_datetime": mock_get_datetime,
+            "mock_finalize_status": mock_finalize_status
+        }
+def test_calculate_thresholds(mock_dependencies):
+    # Setup
+    bronze_writer = BronzeWriter(**mock_dependencies)
+    
+    config_row = Row(allowed_threshold=0.1)
+    
+    # Mock the _get_record_counts method to return a controlled DataFrame
+    counts_df_mock = MagicMock(spec=DataFrame)
+    counts_df_mock.withColumn.return_value = counts_df_mock
+    bronze_writer._get_record_counts.return_value = counts_df_mock
+    
+    # Act
+    result_df = bronze_writer.calculate_thresholds(config_row, MagicMock(), MagicMock())
+    
+    # Assert
+    bronze_writer._get_record_counts.assert_called_once()
+    counts_df_mock.withColumn.assert_any_call("record_count_threshold", F.col("records_total") * F.lit(0.1))
+    counts_df_mock.withColumn.assert_any_call("can_process", F.col("records_rejected") < F.col("record_count_threshold"))
+    assert result_df is counts_df_mock
+def test_update_file_list_status_success(mock_dependencies, capfd):
+    # Setup
+    bronze_writer = BronzeWriter(**mock_dependencies)
+    files_to_update_df = MagicMock(spec=DataFrame)
+    files_to_update_df.isEmpty.return_value = False
+    files_to_update_df.count.return_value = 5
+
+    # Act
+    bronze_writer.update_file_list_status(files_to_update_df)
+
+    # Assert
+    mock_dependencies["delta_manager"].merge_df_to_table.assert_called_once_with(
+        source_df=files_to_update_df,
+        target_table="mock_catalog.mock_schema.file_list",
+        merge_condition="tgt.file_path = src.file_path",
+        update_dict={"loaded _to_bronze": "src.new_status", "updated_timestamp": "src.new_timestamp"},
+        update_condition=f"tgt. loaded_to_bronze = {FileStatus.PROCESSING.value} AND tgt.databricks_run_id = src.databricks_run_id"
+    )
+    captured = capfd.readouterr()
+    assert "Updating status for 5 files..." in captured.out
+
+def test_update_file_list_status_empty_df(mock_dependencies, capfd):
+    # Setup
+    bronze_writer = BronzeWriter(**mock_dependencies)
+    files_to_update_df = MagicMock(spec=DataFrame)
+    files_to_update_df.isEmpty.return_value = True
+
+    # Act
+    bronze_writer.update_file_list_status(files_to_update_df)
+
+    # Assert
+    mock_dependencies["delta_manager"].merge_df_to_table.assert_not_called()
+    captured = capfd.readouterr()
+    assert "No file statuses to update." in captured.out
+
+def test_ingest_files_full_success(mock_dependencies, patch_private_methods):
+    # Setup
+    bronze_writer = BronzeWriter(**mock_dependencies)
+    config_row = Row(
+        catalog_name="catalog",
+        schema_name="schema",
+        target_table_name="target_table",
+        source_folder="source_folder",
+        allowed_threshold=0.1
+    )
+    claimed_files_df = MagicMock(spec=DataFrame)
+    claimed_files_df.select.return_value.collect.return_value = [
+        Row(file_path="path/to/file1.csv")
+    ]
+
+    # Mock threshold_df to have all files "can_process"
+    threshold_df = MagicMock(spec=DataFrame)
+    threshold_df.filter.return_value = threshold_df
+    threshold_df.isEmpty.side_effect = [False, True]  # files_to_process not empty, files_to_reject empty
+    threshold_df.collect.return_value = [
+        Row(file_path="path/to/file1.csv", file_name="file1.csv")
+    ]
+    bronze_writer._calculate_thresholds.return_value = threshold_df
+
+    # Mock the append_df_to_table return value
+    mock_dependencies["delta_manager"].append_df_to_table.return_value = {"file1.csv": 100}
+
+    # Act
+    bronze_writer.ingest_files(config_row, claimed_files_df)
+
+    # Assertions
+    # Check if dependencies were called correctly
+    patch_private_methods["mock_read_source"].assert_called_once()
+    mock_dependencies["data_processor"].trim_all_string_columns.assert_called_once()
+    mock_dependencies["delta_manager"].append_df_to_table.assert_called_once()
+    mock_dependencies["delta_manager"].set_table_properties.assert_called_once()
+    mock_dependencies["logger"].log_file_status.assert_called_once_with(
+        threshold_df.collect()[0],
+        "(mock_catalog).(mock_schema).target_table",
+        "test_run_id",
+        patch_private_methods["mock_get_datetime"].return_value,
+        "Success",
+        succeeded=100
+    )
+    patch_private_methods["mock_finalize_status"].assert_called_once()
+    claimed_files_df.select.assert_called_once_with("file_path")
+
+def test_ingest_files_threshold_failure(mock_dependencies, patch_private_methods):
+    # Setup
+    bronze_writer = BronzeWriter(**mock_dependencies)
+    config_row = Row(
+        catalog_name="catalog",
+        schema_name="schema",
+        target_table_name="target_table",
+        source_folder="source_folder",
+        allowed_threshold=0.1
+    )
+    claimed_files_df = MagicMock(spec=DataFrame)
+    claimed_files_df.select.return_value.collect.return_value = [
+        Row(file_path="path/to/file2.csv")
+    ]
+    
+    # Mock threshold_df to have a file that fails the threshold
+    threshold_df = MagicMock(spec=DataFrame)
+    threshold_df.filter.side_effect = [
+        MagicMock(isEmpty=True),  # files_to_process is empty
+        MagicMock(isEmpty=False, collect=MagicMock(return_value=[
+            Row(file_path="path/to/file2.csv", file_name="file2.csv", records_total=100, records_rejected=20)
+        ]))
+    ]
+    bronze_writer._calculate_thresholds.return_value = threshold_df
+
+    # Act
+    bronze_writer.ingest_files(config_row, claimed_files_df)
+
+    # Assert
+    mock_dependencies["data_processor"].trim_all_string_columns.assert_not_called()
+    mock_dependencies["delta_manager"].append_df_to_table.assert_not_called()
+    mock_dependencies["logger"].log_file_status.assert_called_once_with(
+        threshold_df.filter()[1].collect()[0],
+        "(mock_catalog).(mock_schema).target_table",
+        "test_run_id",
+        patch_private_methods["mock_get_datetime"].return_value,
+        "Threshold Failure"
+    )
+    patch_private_methods["mock_finalize_status"].assert_called_once()
+
+def test_ingest_files_exception_handling(mock_dependencies, patch_private_methods):
+    # Setup
+    bronze_writer = BronzeWriter(**mock_dependencies)
+    config_row = Row(
+        catalog_name="catalog",
+        schema_name="schema",
+        target_table_name="target_table",
+        source_folder="source_folder"
+    )
+    claimed_files_df = MagicMock(spec=DataFrame)
+    claimed_files_df.collect.return_value = [
+        Row(file_path="path/to/file1.csv")
+    ]
+
+    # Mock a private method to raise an exception
+    patch_private_methods["mock_read_source"].side_effect = Exception("Test Error")
+
+    # Act
+    bronze_writer.ingest_files(config_row, claimed_files_df)
+
+    # Assert
+    mock_dependencies["logger"].log_error.assert_called_once()
+    mock_dependencies["logger"].log_file_status.assert_called_once_with(
+        claimed_files_df.collect()[0],
+        "(mock_catalog).(mock_schema).target_table",
+        "test_run_id",
+        patch_private_methods["mock_get_datetime"].return_value,
+        "Failed"
+    )
+    patch_private_methods["mock_finalize_status"].assert_called_once()
