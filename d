@@ -1,7 +1,24 @@
-@or(
-    not(isInt(last(split(substring(pipeline().parameters.fileName, 0, lastIndexOf(pipeline().parameters.fileName, '.')), '_')))), 
+@not(
     or(
-        greaterOrEquals(length(last(split(substring(pipeline().parameters.fileName, 0, lastIndexOf(pipeline().parameters.fileName, '.')), '_'))), 4), 
-        equals(last(split(substring(pipeline().parameters.fileName, 0, lastIndexOf(pipeline().parameters.fileName, '.')), '_')), '1')
+        contains(pipeline().parameters.filename, '_2.'),
+        or(
+            contains(pipeline().parameters.filename, '_3.'),
+            or(
+                contains(pipeline().parameters.filename, '_4.'),
+                or(
+                    contains(pipeline().parameters.filename, '_5.'),
+                    or(
+                        contains(pipeline().parameters.filename, '_6.'),
+                        or(
+                            contains(pipeline().parameters.filename, '_7.'),
+                            or(
+                                contains(pipeline().parameters.filename, '_8.'),
+                                contains(pipeline().parameters.filename, '_9.')
+                            )
+                        )
+                    )
+                )
+            )
+        )
     )
 )
