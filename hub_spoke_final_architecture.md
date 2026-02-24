@@ -1,6 +1,6 @@
 # Hub & Spoke Architecture — Final Reference Guide
 ## Databricks + Azure DevOps
-
+https://mermaid.ai/d/f5379ba3-043a-4050-8ddc-cade394990ff
 ---
 
 ## 1. Your Framework — How It Works
@@ -871,3 +871,4 @@ flowchart TD
     style J fill:#27ae60,color:#fff
     style I fill:#f39c12,color:#fff
 ```
+
