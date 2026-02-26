@@ -1,0 +1,1097 @@
+# Bronze Layer — Complete Implementation Plan
+
+Everything discussed: package structure, `setup.py`, entry points, `EnvironmentConfig` class (workspace → env → catalog/schema/paths), `read_source` dispatcher, format-specific readers, YAML configs, and Databricks job wiring.
+
+---
+
+## 1. Package Structure
+
+```
+core_utils/
+├── setup.py                          # Package build config + entry points
+├── pyproject.toml                    # (optional) modern build config
+├── requirements.txt                  # pyyaml (pyspark provided by Databricks)
+├── src/
+│   └── core_utils/
+│       ├── __init__.py
+│       ├── entrypoints.py            # CLI entry points for bronze/silver/gold
+│       ├── core/
+│       │   ├── __init__.py
+│       │   └── environment_config.py # ★ NEW: Workspace → env → catalog/schema/paths
+│       ├── bronze/
+│       │   ├── __init__.py
+│       │   ├── config_loader.py      # Load + validate YAML config
+│       │   ├── readers.py            # read_source dispatcher + format readers
+│       │   └── writer.py             # write_to_target (Delta table writer)
+│       ├── silver/
+│       │   ├── __init__.py
+│       │   └── silver_runner.py      # Silver logic (future)
+│       └── gold/
+│           ├── __init__.py
+│           └── gold_runner.py        # Gold logic (future)
+├── configs/
+│   └── bronze/
+│       ├── sample_csv.yml            # Example: CSV ingestion config
+│       ├── sample_parquet.yml        # Example: Parquet ingestion config
+│       └── sample_txt.yml           # Example: TXT ingestion config
+└── tests/
+    ├── test_config_loader.py
+    ├── test_readers.py
+    └── test_environment_config.py
+```
+
+---
+
+## 2. `setup.py` — Entry Points
+
+```python
+# setup.py
+from setuptools import setup, find_packages
+
+setup(
+    name="core_utils",
+    version="1.0.0",
+    description="Bronze/Silver/Gold ETL framework for Databricks",
+    author="Your Team",
+    package_dir={"": "src"},
+    packages=find_packages(where="src"),
+    python_requires=">=3.9",
+    install_requires=[
+        "pyyaml>=6.0",
+        # pyspark is NOT listed — provided by Databricks runtime
+    ],
+    entry_points={
+        "console_scripts": [
+            # Each entry point maps to a function in entrypoints.py
+            "run-bronze=core_utils.entrypoints:bronze_entry",
+            "run-silver=core_utils.entrypoints:silver_entry",
+            "run-gold=core_utils.entrypoints:gold_entry",
+        ],
+    },
+)
+```
+
+> [!IMPORTANT]
+> `pyspark` is intentionally **NOT** in `install_requires`. Databricks clusters already have it pre-installed. Including it would cause conflicts.
+
+---
+
+## 3. `environment_config.py` — EnvironmentConfig Class
+
+This class resolves the current Databricks **workspace ID → environment** and builds all environment-specific paths. It supports two modes:
+
+- **Initialized with parameters** (`catalog`, `schema`) → methods return pre-built defaults
+- **Called with explicit arguments** → methods dynamically build and return custom values
+
+```python
+# src/core_utils/core/environment_config.py
+import os
+import json
+import requests
+
+
+# ──────────────────────────────────────────────
+#  Workspace ID → Environment Mapping
+#  Update these to match YOUR workspace IDs
+# ──────────────────────────────────────────────
+WORKSPACE_ENV_MAP = {
+    "1234567890123456": "dev",
+    "2345678901234567": "staging",
+    "3456789012345678": "prod",
+}
+
+# Fallback if workspace ID is not in the map
+DEFAULT_ENV = "dev"
+
+
+class EnvironmentConfig:
+    """
+    Resolves Databricks workspace context into environment-specific
+    catalog names, schema names, Volumes paths, audit/error log tables.
+
+    Usage:
+        # Mode 1: Initialize with defaults (catalog/schema auto-resolved)
+        env = EnvironmentConfig()
+        env.get_catalog()        → "dev_catalog"
+        env.get_schema()         → "dev_bronze"
+
+        # Mode 2: Initialize with explicit defaults
+        env = EnvironmentConfig(catalog="my_catalog", schema="my_schema")
+        env.get_catalog()        → "my_catalog"
+        env.get_schema()         → "my_schema"
+
+        # Mode 3: Override at call time (ignores defaults)
+        env.get_catalog("sales") → "dev_sales"  (env_prefix + param)
+        env.get_schema("gold")   → "dev_gold"
+    """
+
+    def __init__(self, catalog: str = None, schema: str = None):
+        """
+        Initialize EnvironmentConfig.
+
+        Args:
+            catalog: Optional default catalog name. If provided,
+                     get_catalog() returns this value directly.
+                     If None, auto-built as "{env}_catalog".
+            schema:  Optional default schema name. If provided,
+                     get_schema() returns this value directly.
+                     If None, auto-built as "{env}_bronze".
+        """
+        self._workspace_id = self._detect_workspace_id()
+        self._env = WORKSPACE_ENV_MAP.get(self._workspace_id, DEFAULT_ENV)
+
+        # Store user-provided defaults (or None for auto-build)
+        self._default_catalog = catalog
+        self._default_schema = schema
+
+    # ──────────────────────────────────────────
+    #  Workspace & Environment Detection
+    # ──────────────────────────────────────────
+
+    @staticmethod
+    def _detect_workspace_id() -> str:
+        """
+        Get the current Databricks workspace ID.
+
+        First tries the Spark conf, then falls back to the
+        Databricks REST API using the notebook context.
+        """
+        # Method 1: Spark conf (available in jobs and notebooks)
+        try:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.builder.getOrCreate()
+            workspace_id = spark.conf.get(
+                "spark.databricks.workspaceUrl", ""
+            )
+            # Extract workspace ID from URL if needed
+            if workspace_id:
+                # URL format: adb-<workspace_id>.<random>.azuredatabricks.net
+                parts = workspace_id.split("-")
+                if len(parts) > 1:
+                    ws_id = parts[1].split(".")[0]
+                    if ws_id.isdigit():
+                        return ws_id
+        except Exception:
+            pass
+
+        # Method 2: Databricks notebook context
+        try:
+            ctx = json.loads(
+                dbutils.notebook.entry_point   # noqa: F821
+                .getDbutils()
+                .notebook()
+                .getContext()
+                .toJson()
+            )
+            return str(ctx.get("tags", {}).get("orgId", ""))
+        except Exception:
+            pass
+
+        # Method 3: Environment variable (set in cluster config)
+        return os.environ.get("DATABRICKS_WORKSPACE_ID", "unknown")
+
+    @property
+    def environment(self) -> str:
+        """Current environment: 'dev', 'staging', or 'prod'."""
+        return self._env
+
+    @property
+    def workspace_id(self) -> str:
+        """Current Databricks workspace ID."""
+        return self._workspace_id
+
+    # ──────────────────────────────────────────
+    #  Catalog & Schema Builders
+    # ──────────────────────────────────────────
+
+    def get_catalog(self, name: str = None) -> str:
+        """
+        Get the catalog name.
+
+        Args:
+            name: If provided, builds "{env}_{name}".
+                  If None, returns the default catalog.
+
+        Examples:
+            env = EnvironmentConfig()               # env = "dev"
+            env.get_catalog()         → "dev_catalog"
+            env.get_catalog("sales")  → "dev_sales"
+
+            env = EnvironmentConfig(catalog="my_cat")
+            env.get_catalog()         → "my_cat"
+            env.get_catalog("sales")  → "dev_sales"  # override ignores default
+        """
+        if name is not None:
+            return f"{self._env}_{name}"
+        if self._default_catalog is not None:
+            return self._default_catalog
+        return f"{self._env}_catalog"
+
+    def get_schema(self, name: str = None) -> str:
+        """
+        Get the schema name.
+
+        Args:
+            name: If provided, builds "{env}_{name}".
+                  If None, returns the default schema.
+
+        Examples:
+            env = EnvironmentConfig()                # env = "dev"
+            env.get_schema()          → "dev_bronze"
+            env.get_schema("silver")  → "dev_silver"
+
+            env = EnvironmentConfig(schema="custom")
+            env.get_schema()          → "custom"
+            env.get_schema("gold")    → "dev_gold"
+        """
+        if name is not None:
+            return f"{self._env}_{name}"
+        if self._default_schema is not None:
+            return self._default_schema
+        return f"{self._env}_bronze"
+
+    def get_full_table_name(self, table: str,
+                            catalog: str = None,
+                            schema: str = None) -> str:
+        """
+        Build a fully qualified table name: catalog.schema.table
+
+        Args:
+            table:   Table name (required)
+            catalog: Override catalog (optional)
+            schema:  Override schema (optional)
+
+        Examples:
+            env.get_full_table_name("transactions")
+            → "dev_catalog.dev_bronze.transactions"
+
+            env.get_full_table_name("transactions", catalog="sales", schema="gold")
+            → "dev_sales.dev_gold.transactions"
+        """
+        cat = self.get_catalog(catalog)
+        sch = self.get_schema(schema)
+        return f"{cat}.{sch}.{table}"
+
+    # ──────────────────────────────────────────
+    #  Volume & File Paths
+    # ──────────────────────────────────────────
+
+    def get_volumes_root(self, volume_name: str = "raw") -> str:
+        """
+        Get the root Volumes path for the current environment.
+
+        Returns: /Volumes/{catalog}/{schema}/{volume_name}
+
+        Examples:
+            env.get_volumes_root()        → "/Volumes/dev_catalog/dev_bronze/raw"
+            env.get_volumes_root("landing") → "/Volumes/dev_catalog/dev_bronze/landing"
+        """
+        cat = self.get_catalog()
+        sch = self.get_schema()
+        return f"/Volumes/{cat}/{sch}/{volume_name}"
+
+    def get_source_path(self, relative_path: str,
+                        volume_name: str = "raw") -> str:
+        """
+        Build a full source file path from a relative path.
+
+        Args:
+            relative_path: e.g., "falcon/transactions/credit"
+            volume_name:   Volume name (default: "raw")
+
+        Returns: "/Volumes/{catalog}/{schema}/raw/falcon/transactions/credit"
+        """
+        root = self.get_volumes_root(volume_name)
+        return f"{root}/{relative_path}"
+
+    # ──────────────────────────────────────────
+    #  Audit & Error Log Paths
+    # ──────────────────────────────────────────
+
+    def get_audit_log_table(self, table_name: str = None) -> str:
+        """
+        Get the fully qualified audit log table name.
+
+        Args:
+            table_name: Custom audit table name.
+                        Default: "audit_log"
+
+        Examples:
+            env.get_audit_log_table()
+            → "dev_catalog.dev_bronze.audit_log"
+
+            env.get_audit_log_table("bronze_audit")
+            → "dev_catalog.dev_bronze.bronze_audit"
+        """
+        tbl = table_name if table_name else "audit_log"
+        return self.get_full_table_name(tbl)
+
+    def get_error_log_table(self, table_name: str = None) -> str:
+        """
+        Get the fully qualified error log table name.
+
+        Args:
+            table_name: Custom error table name.
+                        Default: "error_log"
+
+        Examples:
+            env.get_error_log_table()
+            → "dev_catalog.dev_bronze.error_log"
+
+            env.get_error_log_table("bronze_errors")
+            → "dev_catalog.dev_bronze.bronze_errors"
+        """
+        tbl = table_name if table_name else "error_log"
+        return self.get_full_table_name(tbl)
+
+    def get_error_log_path(self, subfolder: str = None) -> str:
+        """
+        Get the Volumes path for error log files.
+
+        Returns: /Volumes/{catalog}/{schema}/logs/errors[/subfolder]
+        """
+        root = self.get_volumes_root("logs")
+        path = f"{root}/errors"
+        if subfolder:
+            path = f"{path}/{subfolder}"
+        return path
+
+    def get_checkpoint_path(self, job_name: str) -> str:
+        """
+        Get the checkpoint path for streaming / incremental loads.
+
+        Returns: /Volumes/{catalog}/{schema}/checkpoints/{job_name}
+        """
+        root = self.get_volumes_root("checkpoints")
+        return f"{root}/{job_name}"
+
+    # ──────────────────────────────────────────
+    #  Convenience: Summary
+    # ──────────────────────────────────────────
+
+    def summary(self) -> dict:
+        """Return a dict summarizing the current environment config."""
+        return {
+            "workspace_id":     self._workspace_id,
+            "environment":      self._env,
+            "catalog":          self.get_catalog(),
+            "schema":           self.get_schema(),
+            "volumes_root":     self.get_volumes_root(),
+            "audit_log_table":  self.get_audit_log_table(),
+            "error_log_table":  self.get_error_log_table(),
+            "error_log_path":   self.get_error_log_path(),
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"EnvironmentConfig(env='{self._env}', "
+            f"catalog='{self.get_catalog()}', "
+            f"schema='{self.get_schema()}')"
+        )
+```
+
+### How It Works — Quick Reference
+
+| Scenario | Code | Result (dev workspace) |
+|---|---|---|
+| **Auto-detect everything** | `env = EnvironmentConfig()` | env=dev |
+| Get default catalog | `env.get_catalog()` | `"dev_catalog"` |
+| Get custom catalog | `env.get_catalog("sales")` | `"dev_sales"` |
+| Get default schema | `env.get_schema()` | `"dev_bronze"` |
+| Get custom schema | `env.get_schema("gold")` | `"dev_gold"` |
+| **Init with overrides** | `env = EnvironmentConfig(catalog="my_cat", schema="my_sch")` | |
+| Get default catalog | `env.get_catalog()` | `"my_cat"` |
+| Get custom catalog | `env.get_catalog("sales")` | `"dev_sales"` (override) |
+| Full table name | `env.get_full_table_name("txn")` | `"my_cat.my_sch.txn"` |
+| Audit log table | `env.get_audit_log_table()` | `"my_cat.my_sch.audit_log"` |
+| Error log table | `env.get_error_log_table("bronze_err")` | `"my_cat.my_sch.bronze_err"` |
+| Source file path | `env.get_source_path("falcon/txn")` | `"/Volumes/my_cat/my_sch/raw/falcon/txn"` |
+| Error log path | `env.get_error_log_path("bronze")` | `"/Volumes/my_cat/my_sch/logs/errors/bronze"` |
+| Checkpoint path | `env.get_checkpoint_path("job1")` | `"/Volumes/my_cat/my_sch/checkpoints/job1"` |
+
+> [!IMPORTANT]
+> Update `WORKSPACE_ENV_MAP` with your actual Databricks workspace IDs before deploying.
+
+---
+
+## 4. `entrypoints.py` — CLI Entry Points
+
+```python
+# src/core_utils/entrypoints.py
+import sys
+
+def bronze_entry():
+    """
+    Entry point for the Bronze Databricks job task.
+    Called via: run-bronze <config_path> <config_filename>
+
+    Example:
+        run-bronze /Workspace/.../configs/bronze my_feed.yml
+    """
+    from pyspark.sql import SparkSession
+    from core_utils.core.environment_config import EnvironmentConfig
+    from core_utils.bronze.config_loader import load_bronze_config
+    from core_utils.bronze.readers import read_source
+    from core_utils.bronze.writer import write_to_target
+
+    # Parse CLI arguments passed from Databricks job parameters
+    config_path = sys.argv[1]          # e.g., /Workspace/.../configs/bronze
+    config_filename = sys.argv[2]      # e.g., my_feed.yml
+
+    spark = SparkSession.builder.getOrCreate()
+
+    # Step 1: Detect environment (workspace ID → dev/staging/prod)
+    env_config = EnvironmentConfig()
+    print(f"🌍 Environment: {env_config}")
+
+    # Step 2: Load YAML config
+    config = load_bronze_config(config_path, config_filename)
+
+    # Step 3: Read source files → DataFrame (uses env_config for path resolution)
+    df = read_source(spark, config, env_config)
+
+    # Step 4: Write DataFrame to target Delta table
+    write_to_target(spark, df, config["target"])
+
+    print(f"✅ Bronze load complete: {config['target']['table']}")
+
+
+def silver_entry():
+    """Entry point for Silver layer (future implementation)."""
+    from pyspark.sql import SparkSession
+    from core_utils.core.environment_config import EnvironmentConfig
+    config_path = sys.argv[1]
+    config_filename = sys.argv[2]
+    spark = SparkSession.builder.getOrCreate()
+    env_config = EnvironmentConfig()
+    # TODO: Implement silver logic
+    print(f"Silver entry point — env={env_config.environment}")
+
+
+def gold_entry():
+    """Entry point for Gold layer (future implementation)."""
+    from pyspark.sql import SparkSession
+    from core_utils.core.environment_config import EnvironmentConfig
+    config_path = sys.argv[1]
+    config_filename = sys.argv[2]
+    spark = SparkSession.builder.getOrCreate()
+    env_config = EnvironmentConfig()
+    # TODO: Implement gold logic
+    print(f"Gold entry point — env={env_config.environment}")
+```
+
+---
+
+## 5. `config_loader.py` — YAML Config Loader
+
+```python
+# src/core_utils/bronze/config_loader.py
+import os
+import yaml
+
+
+REQUIRED_SOURCE_FIELDS = ["format", "source_path"]
+REQUIRED_TARGET_FIELDS = ["table", "mode"]
+VALID_FORMATS = ["csv", "parquet", "txt", "json", "binaryfile"]
+VALID_MODES = ["append", "overwrite", "merge"]
+
+
+def load_bronze_config(config_path: str, config_filename: str) -> dict:
+    """
+    Load a Bronze YAML config file and validate it.
+
+    Args:
+        config_path: Directory containing the config file
+                     e.g., /Workspace/.../configs/bronze
+        config_filename: Name of the YAML file
+                         e.g., my_feed.yml
+
+    Returns:
+        Parsed and validated config dictionary
+    """
+    full_path = os.path.join(config_path, config_filename)
+
+    if not os.path.exists(full_path):
+        raise FileNotFoundError(f"Config file not found: {full_path}")
+
+    with open(full_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    _validate_config(config, full_path)
+    return config
+
+
+def _validate_config(config: dict, file_path: str):
+    """Validate that the config has all required fields."""
+    if not config:
+        raise ValueError(f"Empty config file: {file_path}")
+
+    # Validate source section
+    if "source" not in config:
+        raise ValueError(f"Missing 'source' section in {file_path}")
+
+    source = config["source"]
+    if "properties" not in source:
+        raise ValueError(f"Missing 'source.properties' in {file_path}")
+
+    props = source["properties"]
+    for field in REQUIRED_SOURCE_FIELDS:
+        if field not in props:
+            raise ValueError(f"Missing 'source.properties.{field}' in {file_path}")
+
+    fmt = props["format"]
+    if fmt not in VALID_FORMATS:
+        raise ValueError(
+            f"Invalid format '{fmt}' in {file_path}. "
+            f"Supported: {VALID_FORMATS}"
+        )
+
+    # Validate target section
+    if "target" not in config:
+        raise ValueError(f"Missing 'target' section in {file_path}")
+
+    target = config["target"]
+    for field in REQUIRED_TARGET_FIELDS:
+        if field not in target:
+            raise ValueError(f"Missing 'target.{field}' in {file_path}")
+
+    if target["mode"] not in VALID_MODES:
+        raise ValueError(
+            f"Invalid mode '{target['mode']}' in {file_path}. "
+            f"Supported: {VALID_MODES}"
+        )
+
+    if target["mode"] == "merge" and "merge_keys" not in target:
+        raise ValueError(f"mode='merge' requires 'merge_keys' in {file_path}")
+```
+
+---
+
+## 6. `readers.py` — `read_source` Dispatcher + Format Readers
+
+This is the **core file** — the format registry pattern. Now uses `EnvironmentConfig` for path resolution.
+
+```python
+# src/core_utils/bronze/readers.py
+from pyspark.sql import SparkSession, DataFrame
+
+
+# ──────────────────────────────────────────────
+#  Format-specific reader functions
+# ──────────────────────────────────────────────
+
+def read_csv(spark: SparkSession, path: str, options: dict) -> DataFrame:
+    """
+    Read CSV / delimited files.
+
+    Common options from YAML:
+        header, inferSchema, delimiter, encoding, quote, escape,
+        multiLine, nullValue, dateFormat, timestampFormat
+    """
+    reader = spark.read.format("csv")
+    for key, value in options.items():
+        reader = reader.option(key, value)
+    df = reader.load(path)
+    print(f"  📄 read_csv: {df.count()} rows from {path}")
+    return df
+
+
+def read_parquet(spark: SparkSession, path: str, options: dict) -> DataFrame:
+    """
+    Read Parquet files.
+
+    Common options from YAML:
+        mergeSchema
+    """
+    reader = spark.read.format("parquet")
+    for key, value in options.items():
+        reader = reader.option(key, value)
+    df = reader.load(path)
+    print(f"  📄 read_parquet: {df.count()} rows from {path}")
+    return df
+
+
+def read_txt(spark: SparkSession, path: str, options: dict) -> DataFrame:
+    """
+    Read plain text / fixed-width files.
+    Each line becomes a row with a single 'value' column.
+
+    Common options from YAML:
+        lineSep, wholetext
+    """
+    reader = spark.read.format("text")
+    for key, value in options.items():
+        reader = reader.option(key, value)
+    df = reader.load(path)
+    print(f"  📄 read_txt: {df.count()} rows from {path}")
+    return df
+
+
+def read_json(spark: SparkSession, path: str, options: dict) -> DataFrame:
+    """
+    Read JSON files.
+
+    Common options from YAML:
+        multiLine, primitivesAsString, allowComments
+    """
+    reader = spark.read.format("json")
+    for key, value in options.items():
+        reader = reader.option(key, value)
+    df = reader.load(path)
+    print(f"  📄 read_json: {df.count()} rows from {path}")
+    return df
+
+
+def read_binaryfile(spark: SparkSession, path: str, options: dict) -> DataFrame:
+    """
+    Read binary files (e.g., EBCDIC .dat files).
+    Returns columns: path, modificationTime, length, content (binary)
+    """
+    reader = spark.read.format("binaryFile")
+    for key, value in options.items():
+        reader = reader.option(key, value)
+    df = reader.load(path)
+    print(f"  📄 read_binaryfile: {df.count()} files from {path}")
+    return df
+
+
+# ──────────────────────────────────────────────
+#  Format Registry — maps format string → reader function
+# ──────────────────────────────────────────────
+
+FORMAT_READERS = {
+    "csv":        read_csv,
+    "parquet":    read_parquet,
+    "txt":        read_txt,
+    "json":       read_json,
+    "binaryfile": read_binaryfile,
+}
+
+
+# ──────────────────────────────────────────────
+#  Main Dispatcher
+# ──────────────────────────────────────────────
+
+def read_source(spark: SparkSession, config: dict,
+                env_config=None) -> DataFrame:
+    """
+    Main dispatcher — reads source files based on YAML config.
+
+    Workflow:
+        1. Extract format, path, and options from config
+        2. Resolve the full source path (using EnvironmentConfig)
+        3. Look up the appropriate reader function
+        4. Call it and return the DataFrame
+
+    Args:
+        spark:      Active SparkSession
+        config:     Parsed YAML config dict (from load_bronze_config)
+        env_config: EnvironmentConfig instance (for path resolution)
+
+    Returns:
+        DataFrame containing the source data
+
+    Raises:
+        ValueError: If format is not supported
+    """
+    source_props = config["source"]["properties"]
+
+    # Extract config values
+    fmt = source_props["format"]
+    source_path = source_props["source_path"]
+    extension = source_props.get("extension", "")
+    options = source_props.get("options", {})
+
+    # Resolve the full path using EnvironmentConfig
+    resolved_path = _resolve_source_path(source_path, extension, env_config)
+
+    print(f"🔍 read_source: format={fmt}, path={resolved_path}")
+
+    # Look up and call the reader function
+    reader_fn = FORMAT_READERS.get(fmt)
+    if reader_fn is None:
+        supported = ", ".join(FORMAT_READERS.keys())
+        raise ValueError(
+            f"Unsupported format: '{fmt}'. Supported formats: {supported}"
+        )
+
+    df = reader_fn(spark, resolved_path, options)
+    return df
+
+
+def _resolve_source_path(source_path: str, extension: str,
+                         env_config=None) -> str:
+    """
+    Resolve the source path using EnvironmentConfig.
+
+    If the source_path is already absolute (starts with / or abfss://),
+    use as-is. Otherwise, build it using EnvironmentConfig.get_source_path().
+
+    Args:
+        source_path: Relative or absolute path from config
+        extension:   Optional file extension filter (e.g., ".csv")
+        env_config:  EnvironmentConfig instance
+
+    Returns:
+        Fully resolved path string
+    """
+    # If already absolute (Volumes path or ADLS URI), use as-is
+    if source_path.startswith("/") or source_path.startswith("abfss://"):
+        resolved = source_path
+    elif env_config is not None:
+        # Use EnvironmentConfig to build the Volumes path
+        resolved = env_config.get_source_path(source_path)
+    else:
+        # Fallback if no env_config provided
+        resolved = f"/Volumes/raw/{source_path}"
+
+    # Append wildcard extension filter if provided
+    if extension and not resolved.endswith(extension):
+        if not extension.startswith("*"):
+            extension = f"*{extension}"
+        resolved = f"{resolved}/{extension}"
+
+    return resolved
+```
+
+> [!TIP]
+> **Adding a new format is one-line effort:**
+> 1. Write the `read_xyz()` function
+> 2. Add `"xyz": read_xyz` to `FORMAT_READERS`
+>
+> No other files need to change.
+
+---
+
+## 7. `writer.py` — Write to Delta Target
+
+```python
+# src/core_utils/bronze/writer.py
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import current_timestamp, lit
+
+
+def write_to_target(spark: SparkSession, df: DataFrame, target_config: dict):
+    """
+    Write a DataFrame to the target Delta table based on config.
+
+    Supports modes: append, overwrite, merge
+
+    Args:
+        spark: Active SparkSession
+        df: Source DataFrame to write
+        target_config: The 'target' section from the YAML config
+            - table: "catalog.schema.table_name"
+            - mode: "append" | "overwrite" | "merge"
+            - merge_keys: ["col1", "col2"]  (required if mode=merge)
+    """
+    table = target_config["table"]
+    mode = target_config["mode"]
+
+    # Add Bronze metadata columns
+    df = df.withColumn("__bronze_load_ts", current_timestamp())
+    df = df.withColumn("__bronze_tag", lit("BRONZE_OK"))
+
+    if mode in ("append", "overwrite"):
+        df.write.format("delta").mode(mode).saveAsTable(table)
+        print(f"  ✅ Written to {table} (mode={mode})")
+
+    elif mode == "merge":
+        merge_keys = target_config["merge_keys"]
+        _delta_merge(spark, df, table, merge_keys)
+        print(f"  ✅ Merged into {table} on keys={merge_keys}")
+
+    else:
+        raise ValueError(f"Unsupported write mode: {mode}")
+
+
+def _delta_merge(
+    spark: SparkSession,
+    source_df: DataFrame,
+    target_table: str,
+    merge_keys: list
+):
+    """
+    Perform a Delta MERGE (upsert) into the target table.
+    """
+    from delta.tables import DeltaTable
+
+    # Check if target table exists; if not, create it
+    if not spark.catalog.tableExists(target_table):
+        source_df.write.format("delta").saveAsTable(target_table)
+        return
+
+    delta_table = DeltaTable.forName(spark, target_table)
+
+    # Build merge condition: t.key1 = s.key1 AND t.key2 = s.key2
+    condition = " AND ".join(
+        [f"target.{k} = source.{k}" for k in merge_keys]
+    )
+
+    delta_table.alias("target").merge(
+        source_df.alias("source"),
+        condition
+    ).whenMatchedUpdateAll(
+    ).whenNotMatchedInsertAll(
+    ).execute()
+```
+
+---
+
+## 8. YAML Config Examples
+
+### CSV Config
+```yaml
+# configs/bronze/transactions_csv.yml
+source:
+  type: "file"
+  properties:
+    source_path: "falcon/transactions/credit"
+    format: "csv"
+    extension: ".csv"
+    last_n_days: 7
+    options:
+      header: "true"
+      inferSchema: "false"
+      delimiter: ","
+      encoding: "UTF-8"
+
+target:
+  table: "dev_catalog.falcon_bronze.credit_transactions_raw"
+  mode: "append"
+```
+
+### Parquet Config
+```yaml
+# configs/bronze/events_parquet.yml
+source:
+  type: "file"
+  properties:
+    source_path: "falcon/events/clickstream"
+    format: "parquet"
+    extension: ".parquet"
+    options:
+      mergeSchema: "true"
+
+target:
+  table: "dev_catalog.falcon_bronze.clickstream_raw"
+  mode: "overwrite"
+```
+
+### TXT / Fixed-Width Config
+```yaml
+# configs/bronze/legacy_txt.yml
+source:
+  type: "file"
+  properties:
+    source_path: "falcon/legacy/reports"
+    format: "txt"
+    extension: ".txt"
+    options:
+      lineSep: "\n"
+
+target:
+  table: "dev_catalog.falcon_bronze.legacy_reports_raw"
+  mode: "append"
+```
+
+---
+
+## 9. Databricks Job Configuration (DAB)
+
+### Job Resource YAML
+```yaml
+# resources/bronze_job.yml
+resources:
+  jobs:
+    bronze_loader:
+      name: "bronze-loader-${bundle.target}"
+
+      parameters:
+        - name: config_path
+          default: "/Workspace/.bundle/${bundle.name}/${bundle.target}/configs/bronze"
+        - name: config_filename
+          default: ""             # Must be provided at trigger time
+
+      tasks:
+        - task_key: bronze_load
+          python_wheel_task:
+            package_name: core_utils
+            entry_point: run-bronze      # Maps to bronze_entry() in entrypoints.py
+            parameters:
+              - "{{job.parameters.config_path}}"
+              - "{{job.parameters.config_filename}}"
+          libraries:
+            - whl: /Volumes/dev_catalog/default/wheels/core_utils-1.0.0-py3-none-any.whl
+          job_cluster_key: bronze_cluster
+
+      job_clusters:
+        - job_cluster_key: bronze_cluster
+          new_cluster:
+            spark_version: "14.3.x-scala2.12"
+            num_workers: 2
+            node_type_id: "Standard_DS3_v2"
+```
+
+### Multi-Task Pipeline (Bronze → Silver → Gold)
+```yaml
+# resources/etl_pipeline_job.yml
+resources:
+  jobs:
+    etl_pipeline:
+      name: "etl-pipeline-${bundle.target}"
+
+      parameters:
+        - name: config_path
+          default: "/Workspace/.bundle/${bundle.name}/${bundle.target}/configs"
+        - name: bronze_config
+          default: ""
+        - name: silver_config
+          default: ""
+        - name: gold_config
+          default: ""
+
+      tasks:
+        # ── Task 1: Bronze ──
+        - task_key: bronze_load
+          python_wheel_task:
+            package_name: core_utils
+            entry_point: run-bronze
+            parameters:
+              - "{{job.parameters.config_path}}/bronze"
+              - "{{job.parameters.bronze_config}}"
+          libraries:
+            - whl: /Volumes/dev_catalog/default/wheels/core_utils-1.0.0-py3-none-any.whl
+          job_cluster_key: etl_cluster
+
+        # ── Task 2: Silver (depends on Bronze) ──
+        - task_key: silver_transform
+          depends_on:
+            - task_key: bronze_load
+          python_wheel_task:
+            package_name: core_utils
+            entry_point: run-silver
+            parameters:
+              - "{{job.parameters.config_path}}/silver"
+              - "{{job.parameters.silver_config}}"
+          libraries:
+            - whl: /Volumes/dev_catalog/default/wheels/core_utils-1.0.0-py3-none-any.whl
+          job_cluster_key: etl_cluster
+
+        # ── Task 3: Gold (depends on Silver) ──
+        - task_key: gold_aggregate
+          depends_on:
+            - task_key: silver_transform
+          python_wheel_task:
+            package_name: core_utils
+            entry_point: run-gold
+            parameters:
+              - "{{job.parameters.config_path}}/gold"
+              - "{{job.parameters.gold_config}}"
+          libraries:
+            - whl: /Volumes/dev_catalog/default/wheels/core_utils-1.0.0-py3-none-any.whl
+          job_cluster_key: etl_cluster
+
+      job_clusters:
+        - job_cluster_key: etl_cluster
+          new_cluster:
+            spark_version: "14.3.x-scala2.12"
+            num_workers: 4
+            node_type_id: "Standard_DS4_v2"
+```
+
+---
+
+## 10. End-to-End Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Databricks Job Trigger                                        │
+│  Parameters: config_path="/Workspace/.../configs/bronze"       │
+│              config_filename="transactions_csv.yml"             │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  bronze_entry()  (entrypoints.py)                               │
+│                                                                  │
+│  1. EnvironmentConfig() → detects workspace → env="dev"         │
+│  2. sys.argv[1] = config_path                                   │
+│  3. sys.argv[2] = config_filename                               │
+│  4. config = load_bronze_config(config_path, config_filename)   │
+│  5. df = read_source(spark, config, env_config)                 │
+│  6. write_to_target(spark, df, config["target"])                │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  EnvironmentConfig  (environment_config.py)                      │
+│                                                                  │
+│  • workspace_id → "1234567890123456"                            │
+│  • environment  → "dev"                                         │
+│  • get_catalog() → "dev_catalog"                                │
+│  • get_source_path("falcon/txn") → "/Volumes/dev_catalog/..."   │
+│  • get_audit_log_table() → "dev_catalog.dev_bronze.audit_log"   │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  load_bronze_config()  (config_loader.py)                       │
+│                                                                  │
+│  • Reads: /Workspace/.../configs/bronze/transactions_csv.yml    │
+│  • Validates: source.properties.format, target.table, etc.     │
+│  • Returns: { source: {...}, target: {...} }                    │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  read_source()  (readers.py)                                     │
+│                                                                  │
+│  • Reads config → format = "csv"                                │
+│  • Uses env_config.get_source_path() for path resolution        │
+│  • Resolves → /Volumes/dev_catalog/dev_bronze/raw/falcon/...    │
+│  • Looks up FORMAT_READERS["csv"] → read_csv()                  │
+│  • Returns DataFrame                                            │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            ▼               ▼               ▼
+       read_csv()     read_parquet()    read_txt()   ...
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  write_to_target()  (writer.py)                                  │
+│                                                                  │
+│  • Adds __bronze_load_ts, __bronze_tag columns                  │
+│  • Writes to: dev_catalog.falcon_bronze.credit_transactions_raw │
+│  • Mode: append / overwrite / merge                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 11. Build the Wheel
+
+```bash
+# From the core_utils/ root directory
+pip install build
+python -m build --wheel --outdir dist/
+
+# Output: dist/core_utils-1.0.0-py3-none-any.whl
+```
+
+Upload `core_utils-1.0.0-py3-none-any.whl` to:
+- **Databricks Volume**: `/Volumes/dev_catalog/default/wheels/`
+- **OR Azure Artifacts**: for CI/CD pip install at job runtime
+
+---
+
+## 12. Verification Plan
+
+| Step | What to Verify |
+|---|---|
+| 1. Build | `python -m build --wheel` succeeds with no errors |
+| 2. Install | `pip install dist/core_utils-1.0.0-py3-none-any.whl` installs cleanly |
+| 3. Entry points | `run-bronze --help` is available after install |
+| 4. Config load | Create a test YAML and call `load_bronze_config()` — should parse correctly |
+| 5. E2E on Databricks | Upload wheel → create job → trigger with a CSV config → verify Delta table is populated |
