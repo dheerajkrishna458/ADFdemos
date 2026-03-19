@@ -1,0 +1,20 @@
+- task: UsePythonVersion@0
+            displayName: 'Setup Python'
+            inputs:
+              versionSpec: '3.x'
+              addToPath: true
+          - script: |
+              python -m pip install --upgrade pip
+              pip install pytest
+              pytest tests/test_config_overlap.py -v --tb=short --junitxml=test-results.xml
+            displayName: 'Validate Config - No Sourcepath Overlap'
+            workingDirectory: '$(Build.SourcesDirectory)'
+            env:
+              DROPTORAW_CONFIG_PATH: $(Build.SourcesDirectory)/release-pipeline/config/DropToRaw_config.csv
+              DROPTORAW_SB_CONFIG_PATH: $(Build.SourcesDirectory)/release-pipeline/config/droptoraw_SB.csv
+          - task: PublishTestResults@2
+            displayName: 'Publish Config Validation Results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/test-results.xml'
+            condition: always()
