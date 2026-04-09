@@ -1,0 +1,35 @@
+
+      - job: ValidateConfigOverlap
+        displayName: 'Validate Config Sourcepath Overlap (PRs only)'
+        condition: eq(variables['Build.Reason'], 'PullRequest')
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            displayName: 'Setup Python'
+            inputs:
+              versionSpec: '3.x'
+              addToPath: true
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install pytest
+            displayName: 'Install pytest'
+
+          - script: |
+              pytest tests/test_config_overlap.py -v --tb=short --junitxml=test-results.xml
+            displayName: 'Validate Config Files - Sourcepath Overlap Check'
+            workingDirectory: '$(Build.SourcesDirectory)'
+            env:
+              CONFIG_ROOT: $(Build.SourcesDirectory)/release-pipeline/config
+
+          - task: PublishTestResults@2
+            displayName: 'Publish Config Validation Results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/test-results.xml'
+              testRunTitle: 'Config Sourcepath Overlap Validation'
+            condition: always()
+
