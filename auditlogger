@@ -1,0 +1,209 @@
+import argparse
+import logging
+import traceback
+from datetime import datetime
+
+from pyspark.sql import DataFrame, functions as F
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType, LongType
+
+from framework.core.environment import EnvironmentManager
+from framework.core.session import SessionManager
+from framework.modules.io.writer import DeltaManager
+
+class AuditLogger:
+    """Handles auditing and logging for ETL processes."""
+    def __init__(
+        self,
+        spark: SessionManager,
+        args: argparse.Namespace,
+        env_manager: EnvironmentManager = None,
+        delta_manager: DeltaManager = None
+    ):
+        self.spark = spark if spark else SessionManager.get_session()
+        self.args = args
+        self.env_manager = env_manager if env_manager else EnvironmentManager(spark, args)
+        self.delta_manager = delta_manager if delta_manager else DeltaManager(spark, args)
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self.error_logs_fqn = env_manager.get_error_logs_fqn()
+        self.run_load_history_fqn = env_manager.get_run_load_history_fqn()
+        self._loaded_file_summaries = []
+        self.load_stage_name = self._set_stage_name()
+
+    def _set_stage_name(self):
+        return {
+            "bronze": "RawToBronze",
+            "silver": "BronzeToSilver",
+            "gold": "SilverToGold"
+        }.get(self.args.layer, "UnknownStage")
+
+    def _get_datetime_now(self):
+        return datetime.now()
+
+    def log_error(self, error: Exception, error_msg: str = None):
+        """
+        Logs error details to the error logs Delta table and writes to logger.
+
+        Parameters:
+            error (Exception): The exception instance to log.
+        """
+        try:
+            # Prepare error data as a list of tuples
+            error_data = [(
+                self.args.databricks_job_id,
+                self.args.databricks_run_id,
+                self.args.correlation_id,
+                self.args.layer,
+                self.args.entry_point,
+                type(error).__name__,
+                error_msg if error_msg else str(error),
+                traceback.format_exc(),
+                self._get_datetime_now()
+            )]
+
+            # Define schema for error logs
+            schema = StructType([
+                StructField("databricks_job_id", StringType(), True),
+                StructField("databricks_run_id", StringType(), True),
+                StructField("correlation_id", StringType(), True),
+                StructField("layer", StringType(), True),
+                StructField("entry_point", StringType(), True),
+                StructField("error_type", StringType(), True),
+                StructField("error_message", StringType(), True),
+                StructField("stack_trace", StringType(), True),
+                StructField("created_dtm", TimestampType(), True),
+            ])
+
+            # Create DataFrame from error data
+            error_df = self.spark.createDataFrame(error_data, schema)
+
+            # Write error DataFrame to Delta table
+            self.delta_manager.write_df(error_df, self.error_logs_fqn, mode='append')
+
+            # Log info message indicating successful error logging
+            self.logger.info(f"Error logged to {self.error_logs_fqn}.")
+
+        except Exception as log_e:
+            # Log critical message if error logging fails
+            self.logger.critical(f"Failed to log error: {log_e}")
+
+    def log_file_load(self, **kwargs):
+        """
+        Store a per-file log summary in memory to write at end.
+        """
+
+        defaults = {
+            "databricks_job_id": self.args.databricks_job_id,
+            "databricks_run_id": self.args.databricks_run_id,
+            "correlation_id": self.args.correlation_id,
+            "load_stage_name": self.load_stage_name,
+            "records_total": 0,
+            "records_succeeded": 0,
+            "records_rejected": 0,
+            "records_deleted": 0,
+            "records_duplicate": 0,
+            "operation_type": "write",
+            "start_dtm": self._get_datetime_now(),
+            "end_dtm": self._get_datetime_now(),
+            "manual_intervention_reason": self.args.manual_intervention_reason,
+            "load_type_name": "Pipeline" if self.args.email_id.startswith("TR_") else "Manual",
+            "load_create_user_id": self.args.email_id
+        }
+
+        log_data = {**defaults, **kwargs}
+        self._loaded_file_summaries.append(log_data)
+
+    def log_run_summary(self):
+        """
+        Writes all staged file load entries to run_load_history table.
+        """
+
+        if not self._loaded_file_summaries:
+            self.logger.info("No file summaries to write in run summary.")
+            return
+
+        schema = StructType([
+            StructField("databricks_job_id", StringType(), True),
+            StructField("databricks_run_id", StringType(), True),
+            StructField("correlation_id", StringType(), True),
+            StructField("source_name", StringType(), True),
+            StructField("target_name", StringType(), True),
+            StructField("load_stage_name", StringType(), True),
+            StructField("operation_type", StringType(), True),
+            StructField("records_total", LongType(), True),
+            StructField("records_succeeded", LongType(), True),
+            StructField("records_rejected", LongType(), True),
+            StructField("records_deleted", LongType(), True),
+            StructField("records_duplicate", LongType(), True),
+            StructField("load_status", StringType(), True),
+            StructField("manual_intervention_reason", StringType(), True),
+            StructField("start_dtm", TimestampType(), True),
+            StructField("end_dtm", TimestampType(), True),
+            StructField("load_type_name", StringType(), True),
+            StructField("load_create_user_id", StringType(), True)
+        ])
+
+        df = self.spark.createDataFrame(self._loaded_file_summaries, schema)
+
+        self.delta_manager.write_df(df, self.run_load_history_fqn, "append")
+
+        self.logger.info(f"Run summary logged to {self.run_load_history_fqn}.")
+
+    def log_run_audit(self, df, config, event_type, start_dtm, exception=None):
+        """
+        Logs audit information for ETL runs in silver and gold layers.
+
+        This function is intended for use only in silver and gold layers, where the record counts are calculated as the total row count of the entire source table for both layers. 
+        On success, it compares the row count of the source DataFrame (`df`) and the target table to determine load status. 
+        On failure, it logs the error details and marks the load as failed. 
+        Audit details are staged in memory for later persistence.
+
+        Note: This logic may be changed in the future based on how loading is implemented in silver and gold layers.
+
+        Parameters:
+            df (DataFrame): Source DataFrame used for row count comparison.
+            config (dict): ETL configuration dictionary.
+            load_stage_name (str): Name of the current load stage.
+            event_type (str): "success" or "failure" event indicator.
+            exception (Exception, optional): Exception instance for failure events.
+        """
+        source_name = self.env_manager.construct_table_fqn(config.get('source', {}).get("properties", {}).get("table"))
+        target_name = self.env_manager.construct_table_fqn(config.get('destination', {}).get("table"))
+        args = {
+            "source_name": source_name,
+            "target_name": target_name,
+            "load_stage_name": self.load_stage_name,
+            "operation_type": config.get('destination', {}).get("mode"),
+            "records_total": 0,
+            "records_succeeded": 0,
+            "records_rejected": 0,
+            "records_deleted": 0,
+            "records_duplicate": 0,
+            "load_status": "Success",
+            "start_dtm": start_dtm
+        }
+
+        if event_type == "success":
+            if df is not None:
+                succeeded_df = self.spark.table(args["target_name"])
+                records_succeeded = succeeded_df.count()
+                args["records_total"] = records_succeeded
+                args["records_succeeded"] = records_succeeded
+                source_row_count = df.count()
+                args["load_status"] = "Success" if records_succeeded == source_row_count else "Failed"
+            else:
+                # For empty scenario
+                args["records_total"] = 0
+                args["records_succeeded"] = 0
+                args["load_status"] = "Success"
+        elif event_type == "failure":
+            pipeline_name = config.get('pipeline_metadata', {}).get("name")
+            args["load_status"] = "Failed"
+            err_msg = (
+                f"Error in pipeline = '{pipeline_name}' | "
+                f"layer = '{self.args.layer}' | "
+                f"config_file = '{self.args.config_file_name}': {str(exception)}"
+            )
+            self.logger.error(err_msg, exc_info=True)
+            self.log_error(exception, err_msg)
+
+        self.log_file_load(**args)
