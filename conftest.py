@@ -196,32 +196,37 @@ def _setup_framework_stubs():
 
 _setup_framework_stubs()
 
-# Force-import the actual layer .py files from disk
-import importlib.util
-from pathlib import Path
+# Force-import the actual layer .py files from disk using open()+exec()
+# (importlib.util.spec_from_file_location uses stat/readlink syscalls
+#  that Databricks /Workspace/ filesystem does not support)
+import os.path
 
 # Dynamically resolve: conftest.py → tests/layers/ → tests/ → src/ → src/framework/layers/
-_LAYER_BASE = Path(__file__).resolve().parent.parent.parent / "framework" / "layers"
+_THIS_DIR = os.path.dirname(__file__)
+_LAYER_BASE = os.path.join(_THIS_DIR, os.pardir, os.pardir, "framework", "layers")
 
 def _load_layer_module(module_name, file_path):
-    """Load a .py file as a module and register it in sys.modules."""
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    mod = importlib.util.module_from_spec(spec)
+    """Load a .py file as a module by reading and executing it."""
+    mod = types.ModuleType(module_name)
+    mod.__file__ = file_path
+    mod.__package__ = module_name.rsplit(".", 1)[0]
     sys.modules[module_name] = mod
-    spec.loader.exec_module(mod)
+    with open(file_path, "r") as f:
+        source = f.read()
+    exec(compile(source, file_path, "exec"), mod.__dict__)
     return mod
 
 _load_layer_module(
     "framework.layers.bronze.bronze_ingestor",
-    _LAYER_BASE / "bronze" / "bronze_ingestor.py",
+    os.path.join(_LAYER_BASE, "bronze", "bronze_ingestor.py"),
 )
 _load_layer_module(
     "framework.layers.silver.silver_refiner",
-    _LAYER_BASE / "silver" / "silver_refiner.py",
+    os.path.join(_LAYER_BASE, "silver", "silver_refiner.py"),
 )
 _load_layer_module(
     "framework.layers.gold.gold_aggregator",
-    _LAYER_BASE / "gold" / "gold_aggregator.py",
+    os.path.join(_LAYER_BASE, "gold", "gold_aggregator.py"),
 )
 
 
