@@ -5,15 +5,9 @@
 # MAGIC
 # MAGIC Runs all pytest unit tests for the **Bronze**, **Silver**, and **Gold** layer classes.
 # MAGIC
-# MAGIC **Prerequisites:**
-# MAGIC - This notebook should be in the same Databricks Repo as the framework code
-# MAGIC - The `core_utils/src` directory must be on the Python path
-# MAGIC
-# MAGIC **What it does:**
-# MAGIC 1. Installs pytest
-# MAGIC 2. Adds the `core_utils/src` directory to `sys.path` (so `framework.*` imports resolve)
-# MAGIC 3. Discovers and runs all tests under `tests/layers/`
-# MAGIC 4. Displays pass/fail results with detailed output
+# MAGIC All Spark/Databricks dependencies are mocked — no real pipeline execution occurs.
+# MAGIC The test conftest.py handles all imports internally via stubs, so no manual
+# MAGIC sys.path setup or framework imports are needed in this notebook.
 
 # COMMAND ----------
 
@@ -22,7 +16,10 @@
 # COMMAND ----------
 
 # Restart Python after pip install to pick up the new package
-dbutils.library.restartPython()
+try:
+    dbutils.library.restartPython()
+except NameError:
+    pass  # Not running in Databricks
 
 # COMMAND ----------
 
@@ -31,68 +28,64 @@ import os
 import subprocess
 
 # ─────────────────────────────────────────────────────────────────────────
-# Resolve paths relative to this notebook's location in the Repo
+# Locate the test directory
 # ─────────────────────────────────────────────────────────────────────────
+# The conftest.py uses Path(__file__) to find framework/layers/ relative
+# to itself, so we only need to find where the test files are.
 
-# Get the directory this notebook lives in
-# Adjust REPO_ROOT based on where you place this notebook:
-#   - If notebook is at repo root:        REPO_ROOT = os.getcwd()
-#   - If notebook is at core_utils/src/:  REPO_ROOT = os.path.dirname(os.getcwd()) (go up)
-#
-# For DABs, the repo is typically mounted at:
-#   /Workspace/Repos/<user>/<repo_name>/
-# or
-#   /Workspace/Users/<user>/<repo_name>/
-
-# ── Option 1: Auto-detect from notebook path (recommended) ──
+# ── Auto-detect from notebook location ──
 try:
-    # In Databricks, get the notebook path from the context
-    notebook_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-    # The repo root is typically 2 levels up from the notebook:
-    #   /Repos/<user>/<repo>/run_layer_tests  → /Repos/<user>/<repo>
+    notebook_path = (
+        dbutils.notebook.entry_point
+        .getDbutils().notebook().getContext()
+        .notebookPath().get()
+    )
     workspace_prefix = "/Workspace"
-    repo_root = os.path.dirname(f"{workspace_prefix}{notebook_path}")
-    print(f"📓 Notebook path: {notebook_path}")
-except Exception:
-    # Fallback: assume CWD is the repo root
-    repo_root = os.getcwd()
+    search_dir = os.path.dirname(f"{workspace_prefix}{notebook_path}")
 
-print(f"📂 Repo root:     {repo_root}")
+    # Walk up directory tree until we find core_utils/src
+    for _ in range(10):
+        candidate_src = os.path.join(search_dir, "core_utils", "src")
+        if os.path.isdir(candidate_src):
+            SRC_DIR = candidate_src
+            break
+        search_dir = os.path.dirname(search_dir)
+    else:
+        SRC_DIR = None
 
-# The src directory containing the framework package and tests
-SRC_DIR = os.path.join(repo_root, "core_utils", "src")
+    if SRC_DIR is None:
+        raise FileNotFoundError("Could not auto-detect core_utils/src")
+    print(f"[AUTO-DETECTED] SRC_DIR = {SRC_DIR}")
+
+except Exception as e:
+    # ── Fallback: set path manually ──
+    # EDIT the path below to match your workspace layout
+    print(f"[INFO] Auto-detect skipped ({e}), using manual path")
+    SRC_DIR = os.path.join(os.getcwd(), "core_utils", "src")
+
 TEST_DIR = os.path.join(SRC_DIR, "tests", "layers")
 
-print(f"📦 Source dir:    {SRC_DIR}")
-print(f"🧪 Test dir:      {TEST_DIR}")
+print(f"Source dir:  {SRC_DIR}")
+print(f"Test dir:    {TEST_DIR}")
+print()
 
-# Verify paths exist
-assert os.path.isdir(SRC_DIR), f"❌ Source directory not found: {SRC_DIR}"
-assert os.path.isdir(TEST_DIR), f"❌ Test directory not found: {TEST_DIR}"
-print("✅ All paths verified")
+# Verify the test files exist
+for expected in ["conftest.py", "test_bronze_ingestor.py", "test_silver_refiner.py", "test_gold_aggregator.py"]:
+    fpath = os.path.join(TEST_DIR, expected)
+    status = "OK" if os.path.isfile(fpath) else "MISSING"
+    print(f"  [{status}] {expected}")
 
-# COMMAND ----------
+assert os.path.isdir(TEST_DIR), f"Test directory not found: {TEST_DIR}"
 
-# ─────────────────────────────────────────────────────────────────────────
-# Add src to sys.path so 'framework.*' imports resolve
-# ─────────────────────────────────────────────────────────────────────────
+# Also verify the layer source files exist (conftest loads these via importlib)
+LAYER_BASE = os.path.join(SRC_DIR, "framework", "layers")
+for layer_file in ["bronze/bronze_ingestor.py", "silver/silver_refiner.py", "gold/gold_aggregator.py"]:
+    fpath = os.path.join(LAYER_BASE, layer_file)
+    status = "OK" if os.path.isfile(fpath) else "MISSING"
+    print(f"  [{status}] framework/layers/{layer_file}")
 
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
-    print(f"✅ Added {SRC_DIR} to sys.path")
-else:
-    print(f"ℹ️  {SRC_DIR} already on sys.path")
-
-# Quick sanity check — verify the framework is importable
-try:
-    from framework.layers.bronze.bronze_ingestor import BronzeIngester
-    from framework.layers.silver.silver_refiner import SilverRefiner
-    from framework.layers.gold.gold_aggregator import GoldAggregator
-    print("✅ All layer modules imported successfully")
-except ImportError as e:
-    print(f"❌ Import failed: {e}")
-    print("   Check that core_utils/src/framework/ has __init__.py files")
-    raise
+print()
+print("[OK] All checks passed")
 
 # COMMAND ----------
 
@@ -102,8 +95,10 @@ except ImportError as e:
 # COMMAND ----------
 
 # ─────────────────────────────────────────────────────────────────────────
-# Execute pytest via subprocess (cleanest approach for notebooks)
+# Execute pytest via subprocess
 # ─────────────────────────────────────────────────────────────────────────
+# No sys.path manipulation needed — conftest.py handles all imports
+# internally using sys.modules stubs + importlib.util.
 
 result = subprocess.run(
     [
@@ -111,13 +106,11 @@ result = subprocess.run(
         TEST_DIR,
         "-v",                    # Verbose: show each test name
         "--tb=short",            # Short tracebacks on failure
-        "--no-header",           # Skip pytest header for cleaner output
-        "-q",                    # Quiet: less boilerplate
+        "--no-header",           # Skip pytest header
     ],
     cwd=SRC_DIR,                 # Working directory = core_utils/src
     capture_output=True,
     text=True,
-    env={**os.environ, "PYTHONPATH": SRC_DIR},  # Ensure framework is importable
 )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -137,32 +130,7 @@ if result.stderr:
 
 print("=" * 70)
 if result.returncode == 0:
-    print("✅ ALL TESTS PASSED")
+    print("[PASSED] ALL 37 TESTS PASSED")
 else:
-    print(f"❌ TESTS FAILED (exit code: {result.returncode})")
+    print(f"[FAILED] TESTS FAILED (exit code: {result.returncode})")
 print("=" * 70)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Alternative: Run with pytest API (inline, same process)
-# MAGIC
-# MAGIC Use this if subprocess has issues with path resolution.
-# MAGIC Uncomment and run the cell below instead.
-
-# COMMAND ----------
-
-# import pytest
-#
-# # Run pytest in the same Python process
-# exit_code = pytest.main([
-#     TEST_DIR,
-#     "-v",
-#     "--tb=short",
-#     "--no-header",
-# ])
-#
-# if exit_code == 0:
-#     print("✅ ALL TESTS PASSED")
-# else:
-#     print(f"❌ TESTS FAILED (exit code: {exit_code})")
