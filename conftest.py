@@ -197,13 +197,38 @@ def _setup_framework_stubs():
 _setup_framework_stubs()
 
 # Force-import the actual layer .py files from disk using open()+exec()
-# (importlib.util.spec_from_file_location uses stat/readlink syscalls
-#  that Databricks /Workspace/ filesystem does not support)
+# (importlib.util uses stat/readlink syscalls that Databricks doesn't support)
 import os.path
 
-# Dynamically resolve: conftest.py → tests/layers/ → tests/ → src/ → src/framework/layers/
-_THIS_DIR = os.path.dirname(__file__)
-_LAYER_BASE = os.path.join(_THIS_DIR, os.pardir, os.pardir, "framework", "layers")
+def _find_layer_base():
+    """
+    Walk up from conftest.py's directory to find the framework/layers/ folder.
+    Works regardless of how deep the test files are nested.
+    Checks both direct (framework/layers/) and under src/ (src/framework/layers/).
+    """
+    search_dir = os.path.dirname(__file__)
+    for _ in range(10):
+        # Check: <search_dir>/framework/layers/bronze/bronze_ingestor.py
+        candidate = os.path.join(search_dir, "framework", "layers")
+        marker = os.path.join(candidate, "bronze", "bronze_ingestor.py")
+        if os.path.isfile(marker):
+            return candidate
+        # Check: <search_dir>/src/framework/layers/bronze/bronze_ingestor.py
+        candidate_src = os.path.join(search_dir, "src", "framework", "layers")
+        marker_src = os.path.join(candidate_src, "bronze", "bronze_ingestor.py")
+        if os.path.isfile(marker_src):
+            return candidate_src
+        # Go up one level
+        parent = os.path.dirname(search_dir)
+        if parent == search_dir:
+            break  # reached filesystem root
+        search_dir = parent
+    raise FileNotFoundError(
+        "Could not find framework/layers/ directory. "
+        "Searched upward from: " + os.path.dirname(__file__)
+    )
+
+_LAYER_BASE = _find_layer_base()
 
 def _load_layer_module(module_name, file_path):
     """Load a .py file as a module by reading and executing it."""
