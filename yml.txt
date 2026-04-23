@@ -1,20 +1,33 @@
-- task: UsePythonVersion@0
-            displayName: 'Setup Python'
-            inputs:
-              versionSpec: '3.x'
-              addToPath: true
-          - script: |
-              python -m pip install --upgrade pip
-              pip install pytest
-              pytest tests/test_config_overlap.py -v --tb=short --junitxml=test-results.xml
-            displayName: 'Validate Config - No Sourcepath Overlap'
-            workingDirectory: '$(Build.SourcesDirectory)'
-            env:
-              DROPTORAW_CONFIG_PATH: $(Build.SourcesDirectory)/release-pipeline/config/DropToRaw_config.csv
-              DROPTORAW_SB_CONFIG_PATH: $(Build.SourcesDirectory)/release-pipeline/config/droptoraw_SB.csv
-          - task: PublishTestResults@2
-            displayName: 'Publish Config Validation Results'
-            inputs:
-              testResultsFormat: 'JUnit'
-              testResultsFiles: '**/test-results.xml'
-            condition: always()
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- /local_disk0/.ephemeral_nfs/envs/pythonEnv-3ed882ea-5733-4eff-ac53-37b46d8c341a/bin/python
+rootdir: /Workspace/Users/dkrishnamekala@velera.com/EnterpriseDatabricksDeltaLake- pytest
+configfile: pytest.ini
+plugins: Faker-37.4.0, typeguard-4.3.0
+collecting ... collected 0 items / 1 error
+
+==================================== ERRORS ====================================
+___________ ERROR collecting core_utils/tests/unit/framework/layers ____________
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<frozen importlib._bootstrap>:1387: in _gcd_import
+    ???
+<frozen importlib._bootstrap>:1360: in _find_and_load
+    ???
+<frozen importlib._bootstrap>:1331: in _find_and_load_unlocked
+    ???
+<frozen importlib._bootstrap>:935: in _load_unlocked
+    ???
+/local_disk0/.ephemeral_nfs/cluster_libraries/python/lib/python3.12/site-packages/_pytest/assertion/rewrite.py:186: in exec_module
+    exec(co, module.__dict__)
+unit/framework/layers/conftest.py:231: in <module>
+    _LAYER_BASE = _find_layer_base()
+                  ^^^^^^^^^^^^^^^^^^
+unit/framework/layers/conftest.py:226: in _find_layer_base
+    raise FileNotFoundError(
+E   FileNotFoundError: Could not find framework/layers/ directory. Searched upward from: /Workspace/Users/dkrishnamekala@velera.com/EnterpriseDatabricksDeltaLake- pytest/core_utils/tests/unit/framework/layers
+=========================== short test summary info ============================
+ERROR unit/framework/layers - FileNotFoundError: Could not find framework/layers/ directory. Searched upward from: /Workspace/Users/dkrishnamekala@velera.com/EnterpriseDatabricksDeltaLake- pytest/core_utils/tests/unit/framework/layers
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+=============================== 1 error in 3.43s ===============================
+<ExitCode.INTERRUPTED: 2>
