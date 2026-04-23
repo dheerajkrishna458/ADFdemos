@@ -18,23 +18,7 @@ from unittest.mock import MagicMock
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Environment detection
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _is_pyspark_available():
-    """Check if PySpark is installed (i.e., running on Databricks or with Spark)."""
-    try:
-        import pyspark  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-_ON_DATABRICKS = _is_pyspark_available()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# sys.modules stubs — only applied when PySpark is NOT available (CI agent)
+# sys.modules stubs — make the framework importable everywhere
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _ensure_module(name):
@@ -201,41 +185,44 @@ def _setup_framework_stubs():
     dq_mod.DataQualityCheck = MagicMock(name="DataQualityCheck")
 
 
+
 # ═══════════════════════════════════════════════════════════════════════════
-# Conditional setup: stubs for CI, native imports for Databricks
+# Setup: always apply stubs + load layer modules from disk
 # ═══════════════════════════════════════════════════════════════════════════
+# We always use stubs even on Databricks because:
+#   1. These are pure mock-based unit tests — no real PySpark needed
+#   2. Databricks /Workspace/ paths have import quirks
+#   3. Stubs guarantee a clean, isolated test environment
 
-if not _ON_DATABRICKS:
-    # CI agent / local machine without PySpark — apply stubs
-    _setup_framework_stubs()
+_setup_framework_stubs()
 
-    # Force-import the actual layer modules from disk
-    import importlib.util
-    from pathlib import Path
+# Force-import the actual layer .py files from disk
+import importlib.util
+from pathlib import Path
 
-    # Dynamically resolve: conftest.py → tests/layers/ → tests/ → src/ → src/framework/layers/
-    _LAYER_BASE = Path(__file__).resolve().parent.parent.parent / "framework" / "layers"
+# Dynamically resolve: conftest.py → tests/layers/ → tests/ → src/ → src/framework/layers/
+_LAYER_BASE = Path(__file__).resolve().parent.parent.parent / "framework" / "layers"
 
-    def _load_layer_module(module_name, file_path):
-        """Load a .py file as a module and register it in sys.modules."""
-        spec = importlib.util.spec_from_file_location(module_name, file_path)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = mod
-        spec.loader.exec_module(mod)
-        return mod
+def _load_layer_module(module_name, file_path):
+    """Load a .py file as a module and register it in sys.modules."""
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
-    _load_layer_module(
-        "framework.layers.bronze.bronze_ingestor",
-        _LAYER_BASE / "bronze" / "bronze_ingestor.py",
-    )
-    _load_layer_module(
-        "framework.layers.silver.silver_refiner",
-        _LAYER_BASE / "silver" / "silver_refiner.py",
-    )
-    _load_layer_module(
-        "framework.layers.gold.gold_aggregator",
-        _LAYER_BASE / "gold" / "gold_aggregator.py",
-    )
+_load_layer_module(
+    "framework.layers.bronze.bronze_ingestor",
+    _LAYER_BASE / "bronze" / "bronze_ingestor.py",
+)
+_load_layer_module(
+    "framework.layers.silver.silver_refiner",
+    _LAYER_BASE / "silver" / "silver_refiner.py",
+)
+_load_layer_module(
+    "framework.layers.gold.gold_aggregator",
+    _LAYER_BASE / "gold" / "gold_aggregator.py",
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
