@@ -1,0 +1,51 @@
+Set up this Databricks repository for efficient, consistent GitHub Copilot usage.
+
+PHASE 1 — ANALYZE AND PROPOSE (do not create files yet)
+- Inspect the folder structure, databricks.yml, and only the files needed to understand architecture and shared utilities. Do not read every file in full.
+- Propose the content of each file below, then STOP and wait for my approval.
+
+PHASE 2 — CREATE FILES (only after I approve)
+
+1. .github/copilot-instructions.md  (keep under 60 lines; it is sent with every request)
+   - 5–10 line project overview: purpose, main folders, stack (Databricks, PySpark, Delta, Databricks Asset Bundles).
+   - Core rules:
+     * Read only files relevant to the task; use docs/ARCHITECTURE.md and docs/UTILITIES.md for orientation instead of scanning the repo.
+     * Before writing any helper, search docs/UTILITIES.md and the shared utils package. Reuse or extend; never duplicate. If creating a new shared function, state why existing ones don't fit and add it to docs/UTILITIES.md.
+     * Git: for a new story, create a branch from the latest main named feature/<story-id>-<short-name>. Never commit or push to main. Never rewrite history.
+     * Prefer small, focused functions, type hints, docstrings, and existing logging/config patterns.
+     * Do not add new dependencies without asking.
+
+2. .github/instructions/databricks.instructions.md  (applyTo: pipeline and job code paths)
+   - No hard-coded paths, catalogs, schemas, or secrets; use bundle variables, config, or dbutils.secrets.
+   - Avoid collect()/toPandas() on large data; avoid unnecessary actions, UDFs when built-ins exist, and repeated recomputation.
+   - Writes must be idempotent (e.g., Delta MERGE or overwrite by partition); define explicit schemas for ingestion.
+   - Use Unity Catalog three-level names via config.
+
+3. docs/UTILITIES.md
+   - Index of shared functions: name, file path, one-line purpose. Verify every entry against actual code; do not invent entries. Mark anything uncertain.
+
+4. docs/ARCHITECTURE.md
+   - One short section per area (ingestion, transformation, orchestration, jobs) with entry points and data flow. Max one page.
+
+5. .github/chatmodes/Developer.chatmode.md
+   - Role: implementer only.
+   - Must read docs/plans/<story-id>.md first; if missing or unclear, stop and ask.
+   - Follow the plan; if a change outside the plan seems needed, stop and ask.
+   - Ensure the feature branch exists before editing.
+   - Before finishing: self-review the diff for duplicated logic, unused code, and rule violations; list files changed and utilities reused.
+   - Do not write the full test suite; that belongs to the Tester.
+
+6. .github/chatmodes/Tester.chatmode.md
+   - Role: independent reviewer and tester. Never modify production code; only create or edit files under tests/.
+   - Read the plan file and acceptance criteria, then review the diff against main.
+   - Write and run pytest tests (local SparkSession where possible), covering acceptance criteria, edge cases, nulls, empty inputs, and schema mismatches.
+   - Check for duplicated utilities, performance anti-patterns, and rule violations.
+   - Output a report: PASS/FAIL per acceptance criterion, defects with file and line, and suggested fixes (described, not applied).
+
+7. docs/plans/TEMPLATE.md
+   - Story ID, goal, acceptance criteria, files to change, utilities to reuse, out of scope, risks, test approach.
+
+8. databricks.yml
+   - Add sync excludes for .github/, docs/, and tests/ if not deployed. Change nothing else, and show me the diff.
+
+Finish with a summary of created files and any assumptions or uncertainties.
